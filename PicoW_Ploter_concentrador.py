@@ -4,32 +4,35 @@ import matplotlib.pyplot as plt
 import matplotlib.animation as animation
 from collections import deque
 
-# Configura el puerto serial (ajusta el nombre del puerto y velocidad según tu caso)
-SERIAL_PORT = 'COM22'  # Cambia a tu puerto, por ejemplo '/dev/ttyUSB0' en Linux
+# Configuración del puerto serial
+SERIAL_PORT = 'COM22'  # Cambia esto según tu sistema
 BAUD_RATE = 115200
 
-# Historial limitado de datos
+# Tamaño máximo del historial de datos
 MAX_POINTS = 100
+
+# Crear colas de datos
 timestamps = deque(maxlen=MAX_POINTS)
 tx1_rssi = deque(maxlen=MAX_POINTS)
 tx2_rssi = deque(maxlen=MAX_POINTS)
 tx3_rssi = deque(maxlen=MAX_POINTS)
+tx4_rssi = deque(maxlen=MAX_POINTS)
 
-# Inicializar gráfico
+# Inicializar la gráfica
 fig, ax = plt.subplots()
 line1, = ax.plot([], [], label='TX1', color='red')
 line2, = ax.plot([], [], label='TX2', color='green')
 line3, = ax.plot([], [], label='TX3', color='blue')
+line4, = ax.plot([], [], label='TX4', color='orange')
 
 ax.set_ylim(-110, -20)
 ax.set_xlim(0, MAX_POINTS)
 ax.set_ylabel("RSSI (dBm)")
 ax.set_xlabel("Muestras")
-ax.legend()
-plt.title("RSSI en Tiempo Real")
+ax.legend(loc='upper right')
+plt.title("RSSI en Tiempo Real - TX1 a TX4")
 
 def update_plot(frame):
-    """Función de animación que actualiza la gráfica en tiempo real."""
     try:
         line = ser.readline().decode('utf-8').strip()
         if line.startswith("DATA:"):
@@ -40,24 +43,27 @@ def update_plot(frame):
             tx1_rssi.append(rssi.get('tx1', -100))
             tx2_rssi.append(rssi.get('tx2', -100))
             tx3_rssi.append(rssi.get('tx3', -100))
+            tx4_rssi.append(rssi.get('tx4', -100))
 
-            # Actualiza las líneas de la gráfica
-            line1.set_data(range(len(tx1_rssi)), tx1_rssi)
-            line2.set_data(range(len(tx2_rssi)), tx2_rssi)
-            line3.set_data(range(len(tx3_rssi)), tx3_rssi)
-
-            ax.set_xlim(max(0, len(tx1_rssi) - MAX_POINTS), len(tx1_rssi))
+            # Actualizar datos de las líneas
+            x_vals = range(len(timestamps))
+            line1.set_data(x_vals, tx1_rssi)
+            line2.set_data(x_vals, tx2_rssi)
+            line3.set_data(x_vals, tx3_rssi)
+            line4.set_data(x_vals, tx4_rssi)
+            ax.set_xlim(max(0, len(timestamps) - MAX_POINTS), len(timestamps))
     except Exception as e:
         print("Error leyendo línea:", e)
 
-    return line1, line2, line3
+    return line1, line2, line3, line4
 
-# Iniciar conexión serial
+# Abrir el puerto serial
 ser = serial.Serial(SERIAL_PORT, BAUD_RATE, timeout=1)
 
-# Animación en tiempo real
+# Ejecutar la animación
 ani = animation.FuncAnimation(fig, update_plot, interval=200)
+plt.tight_layout()
 plt.show()
 
-# Cerrar serial al salir (opcional, si necesitas)
+# Cerrar el puerto serial al salir (opcional)
 ser.close()
