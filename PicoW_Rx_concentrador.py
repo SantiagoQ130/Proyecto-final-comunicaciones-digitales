@@ -27,100 +27,92 @@ TX_ADDRESSES = {
     1: b"\xe1\xf0\xf0\xf0\xf0",
     2: b"\xc3\xf0\xf0\xf0\xf0", 
     3: b"\xd2\xf0\xf0\xf0\xf0",
-    4: b"\xb1\xf0\xf0\xf0\xf0"  # Coincide con TX4
+    4: b"\xb1\xf0\xf0\xf0\xf0"
 }
 
-# Variables de control de rendimiento
+# Variables de control simplificadas (sin buffers de promedio)
 last_rssi = {1: -100, 2: -100, 3: -100, 4: -100}
-rssi_buffer = {1: [], 2: [], 3: [], 4: []}  # Buffer para promedio móvil
 last_received_time = {1: 0, 2: 0, 3: 0, 4: 0}
-packet_count = {1: 0, 2: 0, 3: 0, 4: 0}  # Contador de paquetes
+packet_count = {1: 0, 2: 0, 3: 0, 4: 0}
 
-# Configuración de buffers y timeouts (optimizados)
-BUFFER_SIZE = 10  # 10 segundos de buffer como los TX
-RSSI_TIMEOUT_MS = 15000  # 15 segundos timeout (más agresivo)
-UPDATE_INTERVAL_MS = 200  # 200ms = 5Hz (sincronizado con monitor)
+# Configuración optimizada para recepción continua
+RSSI_TIMEOUT_MS = 10000  # 10 segundos timeout (más agresivo)
+UPDATE_INTERVAL_MS = 50   # 50ms = 20Hz (más frecuente para datos continuos)
+MAX_PACKETS_PER_CYCLE = 20  # Procesar hasta 20 paquetes por ciclo
 
 # Variables de control de tiempo
 last_update_time = 0
 last_stats_time = 0
 
 def setup_nrf24l01():
-    """Configuración optimizada del NRF24L01 (igual que transmisores)"""
+    """Configuración ultra optimizada del NRF24L01 para recepción continua"""
     spi = SPI(SPI_ID, sck=Pin(SCK_PIN), mosi=Pin(MOSI_PIN), miso=Pin(MISO_PIN))
     csn = Pin(CSN_PIN, mode=Pin.OUT, value=1)
     ce = Pin(CE_PIN, mode=Pin.OUT, value=0)
     
-    nrf = NRF24L01(spi, csn, ce, payload_size=8)  # 4 bytes ID + 4 bytes RSSI
+    nrf = NRF24L01(spi, csn, ce, payload_size=8)
     nrf.set_channel(CANAL_RF)
     
-    # Configuración idéntica a transmisores para máximo rendimiento
-    nrf.reg_write(0x06, 0x0E)  # 2Mbps, máxima potencia (+0dBm)
-    nrf.reg_write(0x1C, 0x00)  # Deshabilitar auto-ACK para mayor velocidad
-    nrf.reg_write(0x1D, 0x00)  # Sin retransmisiones automáticas
+    # Configuración para máximo throughput y mínima latencia
+    nrf.reg_write(0x06, 0x0E)  # 2Mbps, máxima potencia
+    nrf.reg_write(0x1C, 0x00)  # Sin auto-ACK (máxima velocidad)
+    nrf.reg_write(0x1D, 0x00)  # Sin retransmisiones
+    nrf.reg_write(0x11, 0x00)  # Vaciar TX FIFO
+    nrf.reg_write(0x17, 0x70)  # Limpiar flags de estado
     
-    # Abrir pipes de recepción para todos los transmisores
+    # Configurar todos los pipes de recepción
     for pipe, addr in TX_ADDRESSES.items():
         nrf.open_rx_pipe(pipe, addr)
     
-    # Verificar comunicación con NRF24L01
+    # Verificar comunicación
     try:
         config_reg = nrf.reg_read(0x00)
-        print(f"DEBUG:NRF24L01 RX configurado - Config: 0x{config_reg:02x}")
+        print(f"DEBUG:NRF24L01 RX Ultra configurado - Config: 0x{config_reg:02x}")
         return nrf
     except Exception as e:
         print(f"DEBUG:Error NRF24L01 - {e}")
         return None
 
 def setup_oled():
-    """Configuración de OLED con manejo de errores"""
+    """Configuración de OLED optimizada"""
     try:
         i2c = I2C(1, scl=Pin(SCL), sda=Pin(SDA))
         oled = SSD1306_I2C(WIDTH, HEIGHT, i2c)
         oled.fill(0)
-        oled.text("Iniciando RX...", 0, 20)
-        oled.text("NRF24L01", 20, 35)
+        oled.text("RX Continuo", 25, 20)
+        oled.text("Preparando...", 20, 35)
         oled.show()
-        print("DEBUG:OLED inicializado correctamente")
+        print("DEBUG:OLED inicializado")
         return oled
     except Exception as e:
         print(f"DEBUG:Error OLED - {e}")
         return None
 
-def update_rssi_buffer(tx_id, rssi):
-    """Actualiza buffer de RSSI para promedio móvil (como TX)"""
-    global last_rssi, rssi_buffer, last_received_time, packet_count
+def update_rssi_direct(tx_id, rssi):
+    """Actualización directa de RSSI sin promedios"""
+    global last_rssi, last_received_time, packet_count
     
     current_time = utime.ticks_ms()
     last_received_time[tx_id] = current_time
     packet_count[tx_id] += 1
     
-    # Mantener buffer de últimos valores para promedio
-    rssi_buffer[tx_id].append(rssi)
-    if len(rssi_buffer[tx_id]) > BUFFER_SIZE:
-        rssi_buffer[tx_id].pop(0)
-    
-    # Calcular promedio móvil
-    if rssi_buffer[tx_id]:
-        promedio = sum(rssi_buffer[tx_id]) / len(rssi_buffer[tx_id])
-        last_rssi[tx_id] = int(promedio)
+    # Actualización directa sin buffer
+    last_rssi[tx_id] = rssi
 
 def check_timeouts():
-    """Verifica timeouts y resetea valores (optimizado)"""
+    """Verificación rápida de timeouts"""
     current_time = utime.ticks_ms()
     
     for tx_id in TX_ADDRESSES:
         time_diff = utime.ticks_diff(current_time, last_received_time[tx_id])
-        if time_diff > RSSI_TIMEOUT_MS:
-            if last_rssi[tx_id] != -100:
-                last_rssi[tx_id] = -100
-                rssi_buffer[tx_id].clear()  # Limpiar buffer
-                print(f"TIMEOUT:TX{tx_id} - {time_diff}ms sin respuesta")
+        if time_diff > RSSI_TIMEOUT_MS and last_rssi[tx_id] != -100:
+            last_rssi[tx_id] = -100
+            print(f"TIMEOUT:TX{tx_id}")
 
 def send_data_to_computer():
-    """Envía datos al PC en formato JSON optimizado"""
+    """Envío optimizado de datos al PC"""
     data = {
-        "timestamp": utime.ticks_ms(),
+        "t": utime.ticks_ms(),  # Clave acortada
         "rssi": {
             "tx1": last_rssi[1],
             "tx2": last_rssi[2], 
@@ -131,47 +123,46 @@ def send_data_to_computer():
     print(f"DATA:{json.dumps(data)}")
 
 def show_oled_status(oled):
-    """Muestra estado en OLED con diseño mejorado"""
+    """Display OLED optimizado para datos continuos"""
     if not oled:
         return
     
     try:
         oled.fill(0)
-        oled.text("NRF24L01 RX", 20, 0)
+        oled.text("RX CONTINUO", 25, 0)
         
-        # Mostrar RSSI con indicadores de estado
+        # Mostrar RSSI con indicadores más compactos
         for i, tx_id in enumerate([1, 2, 3, 4]):
             rssi = last_rssi[tx_id]
-            y_pos = 15 + (i * 10)
+            y_pos = 12 + (i * 12)
             
-            # Indicador de estado: OK/TIMEOUT
-            status = "OK" if rssi > -100 else "TO"
-            oled.text(f"TX{tx_id}:{rssi:4d} {status}", 0, y_pos)
+            # Estado: "OK" si recibe datos, "TO" si timeout
+            status = "OK" if rssi > -100 else "X"
+            oled.text(f"TX{tx_id} {rssi:3d} {status}", 0, y_pos)
         
-        # Mostrar canal
-        oled.text(f"CH:{CANAL_RF}", 95, 55)
+        # Info de canal y frecuencia de actualización
+        oled.text(f"CH{CANAL_RF} 20Hz", 75, 55)
         oled.show()
         
     except Exception as e:
-        print(f"DEBUG:Error OLED update - {e}")
+        print(f"DEBUG:Error OLED - {e}")
 
 def mostrar_error_nrf(oled):
-    """Muestra error del NRF24L01 en pantalla"""
+    """Error display para NRF24L01"""
     if oled:
         oled.fill(0)
-        oled.text("RX - ERROR", 30, 15)
-        oled.text("NRF24L01 no", 25, 30)
-        oled.text("responde!", 35, 40)
+        oled.text("ERROR NRF", 35, 20)
+        oled.text("Revisar SPI", 25, 35)
         oled.show()
 
 def print_startup_info():
-    """Información de inicio del sistema"""
-    print("SETUP:NRF24L01_RECEIVER_OPTIMIZED")
-    print("CONFIG:{\"transmitters\":[1,2,3,4], \"channel\":10, \"rate\":\"2Mbps\"}")
-    print(f"DEBUG:Buffer size: {BUFFER_SIZE}, Update rate: {1000//UPDATE_INTERVAL_MS}Hz")
+    """Información de inicio optimizada"""
+    print("SETUP:NRF24L01_RX_CONTINUO_OPTIMIZED")
+    print("CONFIG:{\"tx\":[1,2,3,4], \"ch\":10, \"rate\":\"2Mbps\", \"mode\":\"continuous\"}")
+    print(f"DEBUG:Update rate: 20Hz, Max packets/cycle: {MAX_PACKETS_PER_CYCLE}")
 
 def receiver_loop(nrf, oled):
-    """Bucle principal optimizado del receptor"""
+    """Bucle principal ultra optimizado para recepción continua"""
     global last_update_time, last_stats_time
     
     nrf.start_listening()
@@ -182,35 +173,38 @@ def receiver_loop(nrf, oled):
     # Contadores para estadísticas
     total_packets = 0
     packets_per_second = 0
+    rx_errors = 0
     
     while True:
         current_time = utime.ticks_ms()
         
-        # Procesar mensajes RF con máxima eficiencia
-        messages_processed = 0
-        while nrf.any() and messages_processed < 10:  # Limitar para evitar bloqueos
+        # Procesar todos los mensajes RF disponibles (sin límite de tiempo)
+        messages_this_cycle = 0
+        
+        while nrf.any() and messages_this_cycle < MAX_PACKETS_PER_CYCLE:
             led.on()
             try:
                 buf = nrf.recv()
                 if len(buf) == 8:
                     tx_id, rssi = struct.unpack("ii", buf)
                     if tx_id in TX_ADDRESSES:
-                        update_rssi_buffer(tx_id, rssi)
+                        update_rssi_direct(tx_id, rssi)
                         total_packets += 1
                         packets_per_second += 1
-                        # print(f"DEBUG:RX TX{tx_id} = {rssi} dBm")  # Comentado para rendimiento
                     else:
-                        print(f"DEBUG:ID desconocido: {tx_id}")
+                        rx_errors += 1
                 else:
-                    print(f"DEBUG:Payload incorrecto: {len(buf)} bytes")
+                    rx_errors += 1
                     
             except Exception as e:
-                print(f"DEBUG:Error recepción: {e}")
+                rx_errors += 1
+                if rx_errors % 100 == 0:  # Log cada 100 errores
+                    print(f"DEBUG:RX errors: {rx_errors}")
             
             led.off()
-            messages_processed += 1
+            messages_this_cycle += 1
         
-        # Actualizar sistema cada 200ms (5Hz)
+        # Actualizar sistema cada 50ms (20Hz) para datos continuos
         if utime.ticks_diff(current_time, last_update_time) >= UPDATE_INTERVAL_MS:
             check_timeouts()
             send_data_to_computer()
@@ -219,37 +213,37 @@ def receiver_loop(nrf, oled):
         
         # Estadísticas cada segundo
         if utime.ticks_diff(current_time, last_stats_time) >= 1000:
-            if packets_per_second > 0:
-                print(f"DEBUG:Paquetes/seg: {packets_per_second}, Total: {total_packets}")
+            if packets_per_second > 0 or rx_errors > 0:
+                print(f"STATS:PPS:{packets_per_second} Total:{total_packets} Errors:{rx_errors}")
             packets_per_second = 0
             last_stats_time = current_time
         
-        # Pequeña pausa para no saturar CPU
-        utime.sleep_ms(5)
+        # Mínima pausa para no saturar CPU pero mantener responsividad
+        utime.sleep_ms(1)
 
 def main():
-    """Función principal con manejo robusto de errores"""
-    print("DEBUG:Iniciando receptor NRF24L01 optimizado...")
+    """Función principal con manejo de errores"""
+    print("DEBUG:Iniciando receptor continuo NRF24L01...")
     
-    # Configurar OLED primero
+    # Configurar OLED
     oled = setup_oled()
-    utime.sleep_ms(1000)
+    utime.sleep_ms(500)  # Pausa reducida
     
     # Configurar NRF24L01
     nrf = setup_nrf24l01()
     if not nrf:
         mostrar_error_nrf(oled)
-        print("ERROR:NRF24L01 no funciona. Deteniendo programa.")
+        print("ERROR:NRF24L01 fallo. Programa detenido.")
         return
     
     try:
-        # Iniciar bucle principal
+        # Iniciar bucle de recepción continua
         receiver_loop(nrf, oled)
         
     except KeyboardInterrupt:
-        print("DEBUG:Programa interrumpido por usuario")
+        print("DEBUG:Programa interrumpido")
     except Exception as e:
-        print(f"ERROR:Error crítico en main: {e}")
+        print(f"ERROR:Error crítico: {e}")
         if oled:
             oled.fill(0)
             oled.text("ERROR CRITICO", 15, 20)
