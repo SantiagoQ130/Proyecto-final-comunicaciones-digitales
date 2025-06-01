@@ -24,7 +24,7 @@ led = Pin("LED", Pin.OUT)
 
 # Configuración de canal y dirección
 CANAL_RF = 10
-TX_ADDRESS = b"\xb1\xf0\xf0\xf0\xf0"  # Asegúrate que coincida con el RX
+TX_ADDRESS = b"\xd2\xf0\xf0\xf0\xf0"  # Asegúrate que coincida con el RX
 
 # Config WiFi
 SSID = "ArduinoR4-123456"
@@ -82,7 +82,7 @@ def intentar_conexion_wifi(wifi, oled, max_intentos=10):
 def mostrar_conectando_wifi(oled, intento, max_intentos):
     """Muestra el estado de conexión WiFi en la pantalla"""
     oled.fill(0)
-    oled.text("tx3", 45, 0)
+    oled.text("TX3", 45, 0)
     oled.text("Conectando WiFi...", 0, 15)
     oled.text(f"Intento: {intento}/{max_intentos}", 0, 25)
     oled.text(f"SSID: {SSID[:12]}", 0, 35)
@@ -110,14 +110,14 @@ def setup_oled():
     i2c = I2C(1, scl=Pin(SCL), sda=Pin(SDA))  # Usamos I2C(1)
     oled = SSD1306_I2C(WIDTH, HEIGHT, i2c)
     oled.fill(0)
-    oled.text("Iniciando tx3...", 0, 0)
+    oled.text("Iniciando TX3...", 0, 0)
     oled.show()
     return oled
 
 def mostrar_en_oled(oled, rssi, ssid, ip, conectado=True):
     """Muestra información en OLED diferenciando si está conectado o no"""
     oled.fill(0)
-    oled.text("tx3", 50, 0)
+    oled.text("TX3", 50, 0)
     
     if conectado:
         oled.text(f"SSID: {ssid[:12]}", 0, 15)
@@ -135,7 +135,7 @@ def mostrar_en_oled(oled, rssi, ssid, ip, conectado=True):
 def mostrar_error_nrf(oled):
     """Muestra error del NRF24L01 en pantalla"""
     oled.fill(0)
-    oled.text("tx3 - ERROR", 30, 15)
+    oled.text("TX3- ERROR", 30, 15)
     oled.text("NRF24L01 no", 25, 30)
     oled.text("responde!", 35, 40)
     oled.show()
@@ -173,9 +173,6 @@ def main():
     
     # Configurar WiFi
     wifi = conectar_wifi()
-    # Buffer para mantener 10 segundos de datos con frecuencia de 0.2s
-    BUFFER_SIZE = int(10 / 0.2)  # 50 muestras para 10 segundos
-    buffer = []
     
     # Intentar conexión inicial
     conectado = intentar_conexion_wifi(wifi, oled)
@@ -201,25 +198,16 @@ def main():
             conectado = True
             print("Reconexión WiFi exitosa!")
         
-        # Obtener datos de red
-        rssi = get_wifi_strength(wifi)
+        # Obtener datos de red (RSSI ACTUAL - SIN PROMEDIOS)
+        rssi_actual = get_wifi_strength(wifi)
         ssid = wifi.config('essid') if wifi.isconnected() else "Desconocido"
         ip = wifi.ifconfig()[0] if wifi.isconnected() else "0.0.0.0"
         
-        # Mantener buffer de RSSI para promedio móvil (últimos 10 segundos)
-        buffer.append(rssi)
-        if len(buffer) > BUFFER_SIZE:
-            buffer.pop(0)
+        # Mostrar información en OLED (usando RSSI actual)
+        mostrar_en_oled(oled, rssi_actual, ssid, ip, conectado)
         
-        # Calcular promedio con división flotante mejorada
-        promedio = sum(buffer) / len(buffer)
-        promedio_int = int(promedio)
-        
-        # Mostrar información en OLED
-        mostrar_en_oled(oled, promedio_int, ssid, ip, conectado)
-        
-        # Transmitir mensaje
-        if not transmit_message(nrf, promedio_int):
+        # Transmitir mensaje con RSSI actual
+        if not transmit_message(nrf, rssi_actual):
             print("Error en transmisión, continuando...")
         
         utime.sleep(1)
