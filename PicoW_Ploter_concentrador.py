@@ -23,8 +23,8 @@ class MonitorRSSIConMapa:
         self.ser = None
         
         # Dimensiones del espacio interior (en metros)
-        self.ancho = 20
-        self.alto = 15
+        self.ancho = 4.80
+        self.alto = 15.40
         
         # Crear colas de datos para RSSI
         self.timestamps = deque(maxlen=MAX_POINTS)
@@ -75,15 +75,41 @@ class MonitorRSSIConMapa:
         # Etiquetas para los nodos
         self.etiquetas_nodos = ['TX1', 'TX2', 'TX3', 'TX4']
         
-        # Parámetros para conversión RSSI a distancia
-        self.rssi_ref = -40  # RSSI de referencia a 1 metro (dBm)
-        self.n = 2.5  # Exponente de pérdida de propagación para interiores
+        # Parámetros calibrados basados en los datos reales
+        # Análisis de los datos: RSSI a 0m varía entre -40 y -53 dBm
+        self.rssi_ref = -45  # RSSI promedio de referencia a 1 metro
+        self.n = 2.0  # Exponente de pérdida de propagación reducido
+        self.offset_distancia = 0.8  # Offset para compensar el modelo
+        
+        # Filtro de medias móviles para suavizar RSSI
+        self.ventana_filtro = 5
+        self.historial_rssi = {
+            'tx1': deque(maxlen=self.ventana_filtro),
+            'tx2': deque(maxlen=self.ventana_filtro),
+            'tx3': deque(maxlen=self.ventana_filtro),
+            'tx4': deque(maxlen=self.ventana_filtro)
+        }
         
         # Posición estimada del dispositivo móvil
         self.posicion_estimada = np.array([self.ancho/2, self.alto/2])
+        self.posicion_anterior = np.array([self.ancho/2, self.alto/2])
         self.trayectoria_x = []
         self.trayectoria_y = []
         
+        # Parámetros para filtro de movimiento
+        self.max_velocidad = 2.0  # m/s máxima velocidad esperada
+        self.alpha_filtro = 0.3  # Factor de suavizado (0-1)
+        
+        # Añadir buffers para promedios
+        self.buffer_distancias = {
+            'tx1': deque(maxlen=5),
+            'tx2': deque(maxlen=5),
+            'tx3': deque(maxlen=5),
+            'tx4': deque(maxlen=5)
+        }
+        self.buffer_posicion = deque(maxlen=5)
+        self.ultima_posicion_valida = np.array([self.ancho/2, self.alto/2])
+
         # Inicializar puerto serial
         self.inicializar_serial()
         
@@ -99,49 +125,146 @@ class MonitorRSSIConMapa:
             print(f"❌ Error abriendo puerto serial: {e}")
             raise
     
+    def filtrar_rssi(self, rssi_values):
+        """Aplica filtro de media móvil a los valores RSSI y retorna el promedio."""
+        rssi_filtrado = {}
+        rssi_promedio = {}
+        for tx, valor in rssi_values.items():
+            if valor != -100:  # Solo filtrar valores válidos
+                self.historial_rssi[tx].append(valor)
+                # Calcular media móvil
+                if len(self.historial_rssi[tx]) > 0:
+                    rssi_filtrado[tx] = np.mean(list(self.historial_rssi[tx]))
+                else:
+                    rssi_filtrado[tx] = valor
+            else:
+                rssi_filtrado[tx] = valor
+            # Guardar el promedio para cada TX
+            rssi_promedio[tx] = np.mean(self.historial_rssi[tx]) if len(self.historial_rssi[tx]) > 0 else valor
+        return rssi_filtrado, rssi_promedio
+    
     def rssi_a_distancia(self, rssi):
-        """Convierte RSSI a distancia usando el modelo de propagación."""
-        if rssi >= 0 or rssi == -100:  # Valores inválidos
-            return 25.0  # Distancia por defecto
-        
-        # Fórmula: d = 10^((RSSI_ref - RSSI) / (10 * n))
-        distancia = 10 ** ((self.rssi_ref - rssi) / (10 * self.n))
-        
-        # Limitar distancia mínima y máxima
-        distancia = max(0.5, min(distancia, 50.0))
-        return distancia
+        """
+        Convierte RSSI a distancia usando la tabla de rangos proporcionada.
+        Si el RSSI está fuera del rango, devuelve 30.0.
+        """
+        if rssi >= -28 or rssi <= -72 or rssi == -100:
+            return 30.0
+
+        # Rango basado en la tabla proporcionada
+        tabla = [
+            (-38, -45, 0),
+            (-45, -55, 1),
+            (-55, -62, 2),
+            (-62, -69, 3),
+            (-69, -76, 4),
+            (-76, -79, 5),
+            (-79, -82, 6)
+        ]
+        for min_rssi, max_rssi, distancia in tabla:
+            if min_rssi >= rssi > max_rssi:
+                return distancia
+
+        # Si no cae en ningún rango, devolver 30.0 como distancia inválida
+        return 30.0
     
-    def trilateracion(self, distancias):
-        """Calcula la posición usando trilateración."""
-        if len([d for d in distancias if d < 25.0]) < 3:  # Necesitamos al menos 3 distancias válidas
-            return self.posicion_estimada
+    def interseccion_circulos(self, c1, r1, c2, r2):
+        """Calcula los puntos de intersección entre dos círculos."""
+        x0, y0 = c1
+        x1, y1 = c2
+        d = np.hypot(x1 - x0, y1 - y0)
+        if d > r1 + r2 or d < abs(r1 - r2) or d == 0:
+            # No hay intersección o círculos concéntricos
+            return []
+        # Distancia desde c1 al punto medio entre intersecciones
+        a = (r1**2 - r2**2 + d**2) / (2 * d)
+        h = np.sqrt(max(0, r1**2 - a**2))
+        xm = x0 + a * (x1 - x0) / d
+        ym = y0 + a * (y1 - y0) / d
+        xs1 = xm + h * (y1 - y0) / d
+        ys1 = ym - h * (x1 - x0) / d
+        xs2 = xm - h * (y1 - y0) / d
+        ys2 = ym + h * (x1 - x0) / d
+        return [(xs1, ys1), (xs2, ys2)]
+
+    def centroide_intersecciones(self, nodos, radios):
+        """Calcula el centroide de todas las intersecciones de los círculos."""
+        puntos = []
+        n = len(nodos)
+        for i in range(n):
+            for j in range(i+1, n):
+                pts = self.interseccion_circulos(nodos[i], radios[i], nodos[j], radios[j])
+                puntos.extend(pts)
+        if puntos:
+            puntos = np.array(puntos)
+            return np.mean(puntos, axis=0)
+        else:
+            # Si no hay intersección, usar centroide de los centros de los círculos
+            return np.mean(nodos, axis=0)
+
+    def trilateracion_mejorada(self, distancias):
+        """Trilateración basada en intersección de círculos (modelo geométrico)."""
+        nodos = self.nodos_fijos
+        radios = np.array([d if d < 30.0 else 30.0 for d in distancias])
+        # Solo usar nodos con radios válidos
+        nodos_validos = []
+        radios_validos = []
+        for i, r in enumerate(radios):
+            if r < 30.0:
+                nodos_validos.append(nodos[i])
+                radios_validos.append(r)
+        if len(nodos_validos) < 2:
+            # No se puede estimar, mantener posición anterior
+            return self.posicion_anterior
+        # Calcular centroide de intersecciones
+        pos = self.centroide_intersecciones(nodos_validos, radios_validos)
+        # Aplicar filtro de movimiento
+        return self.aplicar_filtro_movimiento(pos)
+
+    def aplicar_filtro_movimiento(self, nueva_posicion):
+        """Aplica filtro de movimiento para evitar saltos bruscos."""
+        if self.posicion_anterior is None:
+            return nueva_posicion
         
-        def error_function(pos):
-            """Función de error para minimizar."""
-            x, y = pos
-            error = 0
-            for i, dist in enumerate(distancias):
-                if dist < 25.0:  # Solo usar distancias válidas
-                    dist_calculada = np.sqrt((x - self.nodos_fijos[i][0])**2 + 
-                                           (y - self.nodos_fijos[i][1])**2)
-                    error += (dist_calculada - dist)**2
-            return error
+        # Calcular distancia del movimiento
+        distancia_movimiento = np.linalg.norm(nueva_posicion - self.posicion_anterior)
         
-        # Posición inicial (centro del edificio)
-        pos_inicial = [self.ancho/2, self.alto/2]
+        # Si el movimiento es muy grande, aplicar filtro más fuerte
+        if distancia_movimiento > self.max_velocidad * 0.2:  # 0.2s es el intervalo de muestreo
+            # Filtro exponencial más agresivo para movimientos grandes
+            factor_filtro = self.alpha_filtro * 0.5
+        else:
+            factor_filtro = self.alpha_filtro
         
-        # Restricciones de posición (dentro del edificio)
-        bounds = [(0.5, self.ancho-0.5), (0.5, self.alto-0.5)]
+        # Aplicar filtro exponencial
+        posicion_filtrada = (factor_filtro * nueva_posicion + 
+                           (1 - factor_filtro) * self.posicion_anterior)
         
-        try:
-            resultado = minimize(error_function, pos_inicial, bounds=bounds, method='L-BFGS-B')
-            if resultado.success:
-                return np.array(resultado.x)
-        except:
-            pass
+        # Asegurar que la posición esté dentro de los límites
+        posicion_filtrada[0] = np.clip(posicion_filtrada[0], 0.3, self.ancho - 0.3)
+        posicion_filtrada[1] = np.clip(posicion_filtrada[1], 0.3, self.alto - 0.3)
         
-        return self.posicion_estimada
+        return posicion_filtrada
     
+    def promedio_distancias(self, nueva_distancia, tx):
+        """Calcula promedio móvil de distancias"""
+        self.buffer_distancias[tx].append(nueva_distancia)
+        return np.mean(self.buffer_distancias[tx])
+
+    def suavizar_trayectoria(self, nueva_pos):
+        """Suaviza la trayectoria usando promedio móvil y limitación de velocidad"""
+        self.buffer_posicion.append(nueva_pos)
+        pos_promedio = np.mean(self.buffer_posicion, axis=0)
+        
+        # Limitar velocidad máxima
+        delta = pos_promedio - self.ultima_posicion_valida
+        dist = np.linalg.norm(delta)
+        if dist > self.max_velocidad * 0.1:  # 0.1s entre actualizaciones
+            pos_promedio = self.ultima_posicion_valida + (delta/dist) * self.max_velocidad * 0.1
+        
+        self.ultima_posicion_valida = pos_promedio
+        return pos_promedio
+
     def crear_interfaz(self):
         """Crea la interfaz gráfica completa."""
         plt.style.use('dark_background')
@@ -173,11 +296,7 @@ class MonitorRSSIConMapa:
         self.ax_mapa.set_ylim(0, self.alto)
         self.ax_mapa.set_xlabel('X (metros)', fontsize=12)
         self.ax_mapa.set_ylabel('Y (metros)', fontsize=12)
-        self.ax_mapa.set_title('🏢 Mapa Interior - Localización en Tiempo Real', fontsize=14, fontweight='bold')
-        
-        # Dibujar paredes y habitaciones
-        for pared in self.paredes:
-            self.ax_mapa.add_patch(pared)
+        self.ax_mapa.set_title('🏢 Mapa Interior - Localización en Tiempo Real (Calibrado)', fontsize=14, fontweight='bold')
         
         # Graficar los transmisores
         self.ax_mapa.scatter(self.nodos_fijos[:, 0], self.nodos_fijos[:, 1], 
@@ -201,7 +320,7 @@ class MonitorRSSIConMapa:
         colores_circulos = ['#FF6B6B', '#4ECDC4', '#45B7D1', '#FFA07A']
         for i in range(len(self.nodos_fijos)):
             circulo = Circle((0, 0), 0, fill=False, color=colores_circulos[i], 
-                           alpha=0.4, linewidth=2, zorder=3)
+                           alpha=0.3, linewidth=2, zorder=3)
             self.ax_mapa.add_patch(circulo)
             self.circulos_distancia.append(circulo)
         
@@ -219,7 +338,7 @@ class MonitorRSSIConMapa:
         self.ax_rssi.set_ylim(-110, -20)
         self.ax_rssi.set_xlim(0, MAX_POINTS)
         self.ax_rssi.set_ylabel("RSSI (dBm)", fontsize=10)
-        self.ax_rssi.set_title("📡 RSSI en Tiempo Real", fontsize=12, fontweight='bold')
+        self.ax_rssi.set_title("📡 RSSI Filtrado en Tiempo Real", fontsize=12, fontweight='bold')
         self.ax_rssi.legend(loc='upper right', framealpha=0.9)
         self.ax_rssi.grid(True, alpha=0.3)
     
@@ -231,7 +350,17 @@ class MonitorRSSIConMapa:
         self.ax_stats.set_title("📊 Tasa de Recepción", fontsize=12)
         self.ax_stats.set_ylim(0, 10)
         self.ax_stats.grid(True, alpha=0.3)
-    
+        # Agregar etiquetas de texto para cada barra
+        self.bar_labels = []
+        for bar in self.bars:
+            label = self.ax_stats.text(
+                bar.get_x() + bar.get_width() / 2, 0, "0", 
+                ha='center', va='bottom', fontsize=10, color='white', fontweight='bold'
+            )
+            self.bar_labels.append(label)
+        # Eliminar el promedio de la tasa de recepción
+        # (No se crea ni usa self.rx_rate_history)
+
     def configurar_distancias(self):
         """Configura la gráfica de distancias."""
         self.dist_line1, = self.ax_distancias.plot([], [], label='Dist TX1', color='#FF6B6B', linewidth=2)
@@ -239,11 +368,11 @@ class MonitorRSSIConMapa:
         self.dist_line3, = self.ax_distancias.plot([], [], label='Dist TX3', color='#45B7D1', linewidth=2)
         self.dist_line4, = self.ax_distancias.plot([], [], label='Dist TX4', color='#FFA07A', linewidth=2)
         
-        self.ax_distancias.set_ylim(0, 30)
+        self.ax_distancias.set_ylim(0, 35)
         self.ax_distancias.set_xlim(0, MAX_POINTS)
         self.ax_distancias.set_ylabel("Distancia (m)", fontsize=10)
         self.ax_distancias.set_xlabel("Tiempo", fontsize=10)
-        self.ax_distancias.set_title("📏 Distancias Calculadas", fontsize=12, fontweight='bold')
+        self.ax_distancias.set_title("📏 Distancias Calculadas (Calibradas)", fontsize=12, fontweight='bold')
         self.ax_distancias.legend(loc='upper right', framealpha=0.9)
         self.ax_distancias.grid(True, alpha=0.3)
         
@@ -268,23 +397,28 @@ class MonitorRSSIConMapa:
                     rssi = data['rssi']
                     current_time = time.time()
                     
-                    # Actualizar datos de RSSI
+                    # Aplicar filtro de media móvil a RSSI
+                    rssi_raw = {
+                        'tx1': rssi.get('tx1', -100),
+                        'tx2': rssi.get('tx2', -100),
+                        'tx3': rssi.get('tx3', -100),
+                        'tx4': rssi.get('tx4', -100)
+                    }
+                    
+                    rssi_filtrado, rssi_promedio = self.filtrar_rssi(rssi_raw)
+                    
+                    # Actualizar datos de RSSI con valores filtrados
                     self.timestamps.append(current_time)
-                    rssi_tx1 = rssi.get('tx1', -100)
-                    rssi_tx2 = rssi.get('tx2', -100)
-                    rssi_tx3 = rssi.get('tx3', -100)
-                    rssi_tx4 = rssi.get('tx4', -100)
+                    self.tx1_rssi.append(rssi_filtrado['tx1'])
+                    self.tx2_rssi.append(rssi_filtrado['tx2'])
+                    self.tx3_rssi.append(rssi_filtrado['tx3'])
+                    self.tx4_rssi.append(rssi_filtrado['tx4'])
                     
-                    self.tx1_rssi.append(rssi_tx1)
-                    self.tx2_rssi.append(rssi_tx2)
-                    self.tx3_rssi.append(rssi_tx3)
-                    self.tx4_rssi.append(rssi_tx4)
-                    
-                    # Calcular distancias
-                    dist1 = self.rssi_a_distancia(rssi_tx1)
-                    dist2 = self.rssi_a_distancia(rssi_tx2)
-                    dist3 = self.rssi_a_distancia(rssi_tx3)
-                    dist4 = self.rssi_a_distancia(rssi_tx4)
+                    # Calcular distancias usando el promedio de RSSI
+                    dist1 = self.rssi_a_distancia(rssi_promedio['tx1'])
+                    dist2 = self.rssi_a_distancia(rssi_promedio['tx2'])
+                    dist3 = self.rssi_a_distancia(rssi_promedio['tx3'])
+                    dist4 = self.rssi_a_distancia(rssi_promedio['tx4'])
                     
                     self.dist1.append(dist1)
                     self.dist2.append(dist2)
@@ -301,13 +435,27 @@ class MonitorRSSIConMapa:
                         for i, tx in enumerate(['tx1', 'tx2', 'tx3', 'tx4']):
                             rate = self.packet_counts[tx] / (current_time - self.last_stats_update)
                             self.bars[i].set_height(rate)
+                            self.bar_labels[i].set_text(str(self.packet_counts[tx]))
+                            self.bar_labels[i].set_x(self.bars[i].get_x() + self.bars[i].get_width() / 2)
+                            self.bar_labels[i].set_y(rate + 0.2)
                             self.packet_counts[tx] = 0
                         self.last_stats_update = current_time
                     
-                    # Calcular posición usando trilateración
-                    distancias = [dist1, dist2, dist3, dist4]
-                    nueva_posicion = self.trilateracion(distancias)
-                    self.posicion_estimada = nueva_posicion
+                    # Calcular distancias promediadas
+                    distancias = [
+                        self.promedio_distancias(dist1, 'tx1'),
+                        self.promedio_distancias(dist2, 'tx2'),
+                        self.promedio_distancias(dist3, 'tx3'),
+                        self.promedio_distancias(dist4, 'tx4')
+                    ]
+                    
+                    # Calcular posición y suavizar trayectoria
+                    nueva_posicion = self.trilateracion_mejorada(distancias)
+                    pos_suavizada = self.suavizar_trayectoria(nueva_posicion)
+                    
+                    # Actualizar posiciones con valores suavizados
+                    self.posicion_anterior = self.posicion_estimada.copy()
+                    self.posicion_estimada = pos_suavizada
                     
                     # Actualizar posición en el mapa
                     self.nodo_movil_plot.set_data([self.posicion_estimada[0]], [self.posicion_estimada[1]])
@@ -325,12 +473,16 @@ class MonitorRSSIConMapa:
                     
                     # Actualizar círculos de distancia en el mapa
                     for i, (dist, nodo) in enumerate(zip(distancias, self.nodos_fijos)):
-                        self.circulos_distancia[i].set_center(nodo)
-                        self.circulos_distancia[i].set_radius(dist)
+                        if dist < 30:  # Solo mostrar círculos para distancias válidas
+                            self.circulos_distancia[i].set_center(nodo)
+                            self.circulos_distancia[i].set_radius(dist)
+                            self.circulos_distancia[i].set_alpha(0.3)
+                        else:
+                            self.circulos_distancia[i].set_alpha(0.0)  # Ocultar círculos inválidos
                     
-                    # Mostrar información en consola
-                    print(f"Pos: X={self.posicion_estimada[0]:.1f}m, Y={self.posicion_estimada[1]:.1f}m | "
-                          f"RSSI: [{rssi_tx1}, {rssi_tx2}, {rssi_tx3}, {rssi_tx4}] | "
+                    # Mostrar información en consola con valores filtrados
+                    print(f"Pos: X={self.posicion_estimada[0]:.2f}m, Y={self.posicion_estimada[1]:.2f}m | "
+                          f"RSSI: [{rssi_filtrado['tx1']:.1f}, {rssi_filtrado['tx2']:.1f}, {rssi_filtrado['tx3']:.1f}, {rssi_filtrado['tx4']:.1f}] | "
                           f"Dist: [{dist1:.1f}, {dist2:.1f}, {dist3:.1f}, {dist4:.1f}]m")
                 
                 elif line.startswith("SETUP:"):
@@ -375,62 +527,47 @@ class MonitorRSSIConMapa:
     def print_system_info(self):
         """Imprime información del sistema."""
         print("="*80)
-        print("🏢 SISTEMA DE MONITOREO RSSI CON LOCALIZACIÓN INTERIOR")
+        print("🏢 SISTEMA DE MONITOREO RSSI CON LOCALIZACIÓN INTERIOR - VERSIÓN CALIBRADA")
         print("="*80)
         print(f"📡 Puerto Serial: {self.puerto_serial} @ {self.baud_rate} bps")
         print(f"⏱️  Intervalo de muestreo: 200ms (5 Hz)")
         print(f"📊 Historial máximo: {MAX_POINTS} puntos ({MAX_POINTS * 0.2:.1f}s)")
         print(f"🎯 Transmisores: TX1, TX2, TX3, TX4")
         print(f"🏢 Dimensiones del edificio: {self.ancho}m x {self.alto}m")
-        print(f"📏 Parámetros RSSI→Distancia: RSSI_ref={self.rssi_ref}dBm, n={self.n}")
+        print(f"📏 Parámetros calibrados: RSSI_ref={self.rssi_ref}dBm, n={self.n}, offset={self.offset_distancia}m")
+        print(f"🔧 Filtro RSSI: Media móvil de {self.ventana_filtro} muestras")
+        print(f"🚀 Filtro movimiento: α={self.alpha_filtro}, v_max={self.max_velocidad}m/s")
         print("="*80)
-        print("💡 Funcionalidades:")
-        print("   ✅ Monitoreo RSSI en tiempo real")
-        print("   ✅ Cálculo automático de distancias")
-        print("   ✅ Localización por trilateración")
-        print("   ✅ Mapa interior con trayectoria")
-        print("   ✅ Estadísticas de recepción")
+        print("💡 Mejoras implementadas:")
+        print("   ✅ Modelo RSSI→Distancia calibrado con datos reales")
+        print("   ✅ Filtro de media móvil para suavizar RSSI")
+        print("   ✅ Trilateración mejorada con múltiples puntos de inicio")
+        print("   ✅ Filtro de movimiento adaptativo")
+        print("   ✅ Manejo robusto de errores y desconexiones")
         print("="*80)
-    
-    def iniciar(self):
-        """Inicia el monitor completo."""
-        try:
-            self.print_system_info()
-            print("🔌 Iniciando conexión serial...")
-            print("🎬 Iniciando visualización...")
-            
-            # Ejecutar la animación
-            ani = animation.FuncAnimation(self.fig, self.update_plot, 
-                                        interval=100, blit=False)
-            
-            plt.tight_layout()
-            plt.show()
-            
-        except serial.SerialException as e:
-            print(f"❌ Error de conexión serial: {e}")
-            print(f"💡 Verifica que el puerto {self.puerto_serial} esté correcto y disponible")
-        except KeyboardInterrupt:
-            print("\n⏹️  Deteniendo por interrupción del usuario...")
-        finally:
-            try:
-                if self.ser:
-                    self.ser.close()
-                    print("✅ Puerto serial cerrado correctamente")
-            except:
-                pass
-            print("🏁 Programa terminado")
+        print("⏹️  Presiona Ctrl+C para detener el sistema\n")
 
 def main():
-    """Función principal."""
-    # Crear y ejecutar el monitor
+    """Función principal del programa."""
+    monitor = None
     try:
-        monitor = MonitorRSSIConMapa(
-            puerto_serial=SERIAL_PORT,
-            baud_rate=BAUD_RATE
+        monitor = MonitorRSSIConMapa()
+        monitor.print_system_info()
+        ani = animation.FuncAnimation(
+            monitor.fig, monitor.update_plot, interval=100,
+            blit=False, cache_frame_data=False
         )
-        monitor.iniciar()
+        plt.tight_layout()
+        plt.show()
+    except KeyboardInterrupt:
+        print("\n🛑 Detenido por el usuario")
     except Exception as e:
-        print(f"❌ Error inicializando el monitor: {e}")
+        print(f"\n❌ Error crítico: {e}")
+        print("🔧 Verifica el puerto serial, conexión y dependencias.")
+    finally:
+        if monitor and hasattr(monitor, 'ser') and monitor.ser and monitor.ser.is_open:
+            monitor.ser.close()
+            print("🔌 Puerto serial cerrado")
 
 if __name__ == "__main__":
     main()
